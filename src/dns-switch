@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+check_deps() {
+  local missing=()
+  for cmd in resolvectl awk sed grep mktemp sort head timeout tput; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
+    fi
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Error: Missing required dependencies: ${missing[*]}" >&2
+    exit 1
+  fi
+}
+check_deps
+
+VERSION="1.0.0"
+
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6 2>/dev/null || echo "$HOME")
+
+CONFIG_DIR="$REAL_HOME/.config/dns-switch"
+PROVIDERS_FILE="$CONFIG_DIR/providers.conf"
+STATE_FILE="$CONFIG_DIR/state"
+
+declare -A PROVIDERS
+declare -a PROVIDER_ORDER
+
+_sudo() {
+  if [[ "$EUID" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "Error: Root privileges required for '$1' but 'sudo' is not installed." >&2
+    exit 1
+  fi
+}
+
+load_providers() {
+  [[ -f "$PROVIDERS_FILE" ]] || { echo "Error: Missing $PROVIDERS_FILE" >&2; exit 1; }
+  while IFS='=' read -r name ips || [[ -n "$name" ]]; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    PROVIDERS["$name"]="$ips"
+    PROVIDER_ORDER+=("$name")
+  done < "$PROVIDERS_FILE"
+}
+
+get_links() {
+  resolvectl status 2>/dev/null | awk '/^Link [0-9]/ && $3 != "(lo)" {print $2}' || true
+}
+
+ensure_sudo() {
+  if [[ "$EUID" -eq 0 ]]; then return 0; fi
+  if command -v sudo >/dev/null 2>&1; then
+    if ! sudo -n /usr/bin/resolvectl --version &>/dev/null; then
+      sudo -v || true
+    fi
+  fi
+}
+
+apply() {
+  local name="$1"
+  IFS=',' read -ra ip_arr <<< "${PROVIDERS[$name]}"
+  local links
+  links=$(get_links)
+  
+  if [[ -z "$links" ]]; then
+    echo "Error: No active network links found by resolvectl." >&2
+    return 1
+  fi
+  
+  ensure_sudo
+
+  for link in $links; do
+    _sudo resolvectl dns "$link" "${ip_arr[@]}" || return 1
+    _sudo resolvectl domain "$link" ~. || return 1
+    _sudo resolvectl dnsovertls "$link" yes || return 1
+    _sudo resolvectl dnssec "$link" yes || return 1
+  done
+  
+  _sudo resolvectl flush-caches || true
+}
+
+verify() {
+  timeout 3 resolvectl query example.com &>/dev/null
+}
+
+revert_all() {
+  local links
+  links=$(get_links)
+
+  [[ -n "$links" ]] && ensure_sudo
+
+  for link in $links; do
+    _sudo resolvectl revert "$link" 2>/dev/null || true
+  done
+  
+  _sudo resolvectl flush-caches || true
+}
+
+save_state() {
+  mkdir -p "$CONFIG_DIR"
+  echo "$1" > "$STATE_FILE"
+}
+
+tcp_probe() {
+  local ip="$1"
+  local port="${2:-853}"
+  local start end lat
+  
+  ip="${ip%%#*}"
+
+  start=$(date +%s%3N)
+  if timeout 2 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
+    end=$(date +%s%3N)
+    lat=$((end - start))
+    echo "$lat"
+  else
+    echo "9999"
+  fi
+}
+
+run_probe() {
+  [[ ${#PROVIDER_ORDER[@]} -gt 0 ]] || return 0
+  local temp_dir
+  temp_dir=$(mktemp -d)
+  
+  for name in "${PROVIDER_ORDER[@]}"; do
+    local targets="${PROVIDERS[$name]}"
+    local primary="${targets%%,*}"
+    
+    (
+      local lat
+      lat=$(tcp_probe "$primary")
+      echo "$lat:$name" > "$temp_dir/$name"
+    ) &
+  done
+  
+  wait
+  
+  if compgen -G "$temp_dir/*" > /dev/null; then
+    cat "$temp_dir"/* | sort -t: -k1 -n
+  fi
+  rm -rf "$temp_dir"
+}
+
+bench_cmd() {
+  if [[ ${#PROVIDER_ORDER[@]} -eq 0 ]]; then
+    echo "No DNS providers configured in $PROVIDERS_FILE" >&2
+    return 1
+  fi
+  echo "Benchmarking DoT providers (TCP port 853)..."
+  echo ""
+  local sorted
+  sorted=$(run_probe)
+
+  local rank=1
+  while IFS=':' read -r lat name; do
+    [[ -z "$name" ]] && continue
+    if [[ "$lat" != "9999" ]]; then
+      printf "  %2d. %-18s %5d ms\n" "$rank" "$name" "$lat"
+    else
+      printf "  %2d. %-18s timeout\n" "$rank" "$name"
+    fi
+    ((rank++))
+  done <<< "$sorted"
+}
+
+auto_cmd() {
+  if [[ ${#PROVIDER_ORDER[@]} -eq 0 ]]; then
+    echo "No DNS providers configured in $PROVIDERS_FILE" >&2
+    return 1
+  fi
+  echo "Probing providers for lowest TCP latency..."
+  local sorted
+  sorted=$(run_probe)
+  
+  local fastest_line
+  fastest_line=$(echo "$sorted" | head -n 1)
+  
+  local lat="${fastest_line%%:*}"
+  local name="${fastest_line#*:}"
+  
+  if [[ "$lat" == "9999" || -z "$name" ]]; then
+    echo "Error: All providers timed out. Reverting to default." >&2
+    switch_dns default
+    return
+  fi
+
+  echo "Fastest provider: $name (${lat}ms)"
+  switch_dns "$name"
+}
+
+switch_dns() {
+  local target="$1"
+
+  if [[ "$target" == "default" ]]; then
+    revert_all
+    rm -f "$STATE_FILE"
+    echo "Switched to: default (router DNS)"
+    return
+  fi
+
+  [[ -v "PROVIDERS[$target]" ]] || { echo "Error: Unknown provider '$target'" >&2; exit 1; }
+
+  if ! apply "$target"; then
+    echo "Error: Failed to apply DNS settings for $target." >&2
+    revert_all
+    return 1
+  fi
+
+  if verify; then
+    save_state "$target"
+    echo "Switched to: $target [✓]"
+    return
+  fi
+
+  echo "Error: $target failed verification. Reverting to default router DNS..." >&2
+  revert_all
+  rm -f "$STATE_FILE"
+}
+
+status_cmd() {
+  local current="default"
+  [[ -f "$STATE_FILE" ]] && current=$(cat "$STATE_FILE")
+  
+  printf "%-10s: %s\n" "Provider" "$current"
+  
+  if [[ "$current" != "default" ]] && [[ -v "PROVIDERS[$current]" ]]; then
+    if verify; then
+      printf "%-10s: Resolving correctly [✓]\n" "Status"
+    else
+      printf "%-10s: Failing to resolve [✗]\n" "Status"
+    fi
+  else
+    printf "%-10s: Managed by router/DHCP\n" "Status"
+  fi
+
+  echo ""
+  
+  resolvectl dns 2>/dev/null | grep -E '^Link' | while read -r line; do
+    local iface
+    iface=$(echo "$line" | sed -E 's/Link [0-9]+ \(([^)]+)\):.*/\1/')
+    local ips
+    ips=$(echo "$line" | awk -F': ' '{print $2}')
+    
+    printf "  %-8s: %s\n" "$iface" "${ips:-None}"
+  done
+}
+
+install_cmd() {
+  echo "Installing dns-switch system hooks..."
+  
+  echo "-> Configuring passwordless sudo for resolvectl"
+  local sudoers_file="/etc/sudoers.d/10-resolvectl"
+  echo "$REAL_USER ALL=(root) NOPASSWD: /usr/bin/resolvectl" | _sudo tee "$sudoers_file" >/dev/null
+  _sudo chmod 0440 "$sudoers_file"
+
+  echo "-> Configuring NetworkManager dispatcher"
+  local nm_dir="/etc/NetworkManager/dispatcher.d"
+  if [[ -d "/etc/NetworkManager" ]]; then
+    local nm_file="$nm_dir/50-dns-switch"
+    _sudo mkdir -p "$nm_dir"
+    cat << 'NM_EOF' | _sudo tee "$nm_file" >/dev/null
+#!/usr/bin/env bash
+# Managed by dns-switch
+STATE_FILE="__HOME__/.config/dns-switch/state"
+PROVIDERS_FILE="__HOME__/.config/dns-switch/providers.conf"
+
+case "$2" in
+  up|vpn-up|dns-change) ;;
+  *) exit 0 ;;
+esac
+
+[ -f "$STATE_FILE" ] || exit 0
+
+CHOICE=$(cat "$STATE_FILE")
+[ -z "$CHOICE" ] || [ "$CHOICE" = "default" ] && exit 0
+[ -f "$PROVIDERS_FILE" ] || exit 0
+
+IPS=""
+while IFS='=' read -r name ips || [ -n "$name" ]; do
+  [ "$name" = "$CHOICE" ] && { IPS="$ips"; break; }
+done < "$PROVIDERS_FILE"
+[ -z "$IPS" ] && exit 0
+
+IFS=',' read -ra IP_ARR <<< "$IPS"
+
+/usr/bin/resolvectl status 2>/dev/null | awk '/^Link [0-9]/ && $3 != "(lo)" {print $2}' | while read -r link; do
+  /usr/bin/resolvectl dns "$link" "${IP_ARR[@]}"
+  /usr/bin/resolvectl domain "$link" ~.
+  /usr/bin/resolvectl dnsovertls "$link" yes
+  /usr/bin/resolvectl dnssec "$link" yes
+done
+NM_EOF
+    _sudo sed -i "s|__HOME__|$REAL_HOME|g" "$nm_file"
+    _sudo chmod +x "$nm_file"
+  else
+    echo "-> NetworkManager not detected, skipping dispatcher hook."
+  fi
+
+  echo "-> Configuring systemd-resolved (DNSOverTLS=yes)"
+  local res_dir="/etc/systemd/resolved.conf.d"
+  local res_file="$res_dir/50-dns-switch.conf"
+  _sudo mkdir -p "$res_dir"
+  printf "[Resolve]\nDNSOverTLS=yes\n" | _sudo tee "$res_file" >/dev/null
+  _sudo systemctl restart systemd-resolved || true
+
+  echo "Install complete! [✓]"
+}
+
+uninstall_cmd() {
+  echo "Removing dns-switch system hooks..."
+  _sudo rm -f "/etc/sudoers.d/10-resolvectl"
+  _sudo rm -f "/etc/NetworkManager/dispatcher.d/50-dns-switch"
+  _sudo rm -f "/etc/systemd/resolved.conf.d/50-dns-switch.conf"
+  _sudo systemctl restart systemd-resolved || true
+  echo "Uninstall complete! [✓]"
+}
+
+tui_select() {
+  local options=("$@")
+  local current_idx=0
+  local current_active="default"
+  
+  [[ -f "$STATE_FILE" ]] && current_active=$(cat "$STATE_FILE")
+
+  for i in "${!options[@]}"; do
+    if [[ "${options[$i]}" == "$current_active" ]]; then
+      current_idx=$i
+      break
+    fi
+  done
+
+  tput civis 2>/dev/null || true
+  cleanup() { tput cnorm 2>/dev/null || true; }
+  trap cleanup EXIT INT TERM
+
+  echo "Select a DNS provider:"
+  echo "(up/down to navigate, enter to select, q to cancel)"
+  echo ""
+
+  local key
+  while true; do
+    for i in "${!options[@]}"; do
+      local opt="${options[$i]}"
+      local display="$opt"
+      
+      if [[ "$opt" == "$current_active" ]]; then
+        display="$display [✓]"
+      fi
+
+      if [[ $i -eq $current_idx ]]; then
+        echo -e "> \e[1;36m$display\e[0m"
+      else
+        echo "  $display"
+      fi
+    done
+
+    read -rsn1 key || break
+    case "$key" in
+      $'\x1b')
+        read -rsn2 -t 0.05 key || key=""
+        case "$key" in
+          '[A') current_idx=$((current_idx - 1));;
+          '[B') current_idx=$((current_idx + 1));;
+          *) 
+            tput cuu $((${#options[@]} + 3)) 2>/dev/null || true
+            tput ed 2>/dev/null || true
+            tput cnorm 2>/dev/null || true
+            trap - EXIT INT TERM
+            echo "Cancelled."
+            return 0
+            ;;
+        esac
+        ;;
+      k|K) current_idx=$((current_idx - 1));;
+      j|J) current_idx=$((current_idx + 1));;
+      "") 
+        tput cuu $((${#options[@]} + 3)) 2>/dev/null || true
+        tput ed 2>/dev/null || true
+        tput cnorm 2>/dev/null || true
+        trap - EXIT INT TERM
+        switch_dns "${options[$current_idx]}"
+        return 0
+        ;;
+      q|Q)
+        tput cuu $((${#options[@]} + 3)) 2>/dev/null || true
+        tput ed 2>/dev/null || true
+        tput cnorm 2>/dev/null || true
+        trap - EXIT INT TERM
+        echo "Cancelled."
+        return 0
+        ;;
+    esac
+
+    if [[ $current_idx -lt 0 ]]; then current_idx=$((${#options[@]} - 1)); fi
+    if [[ $current_idx -ge ${#options[@]} ]]; then current_idx=0; fi
+
+    tput cuu ${#options[@]} 2>/dev/null || true
+    tput ed 2>/dev/null || true
+  done
+}
+
+help_cmd() {
+  cat <<'HELP_EOF'
+dns-switch — Manage systemd-resolved DNS over TLS (DoT) + DNSSEC
+
+Usage:
+  dns-switch                      Open interactive TUI picker
+  dns-switch <provider>           Switch to specific DoT provider
+  dns-switch auto                 Benchmark and switch to fastest provider
+  dns-switch bench                Benchmark DoT TCP latency across all providers
+  dns-switch default              Revert to router / DHCP DNS
+  dns-switch status               Show active provider and resolution status
+  dns-switch install              Configure system hooks (requires sudo)
+  dns-switch uninstall            Remove system hooks (requires sudo)
+  dns-switch version, --version        Show version
+  dns-switch help, -h, --help          Show this help message
+HELP_EOF
+}
+
+case "${1:-}" in
+  version|--version)
+    echo "dns-switch v$VERSION"
+    ;;
+  help|-h|--help)
+    help_cmd
+    ;;
+  status)
+    load_providers 2>/dev/null || true
+    status_cmd
+    ;;
+  bench)
+    load_providers
+    bench_cmd
+    ;;
+  auto)
+    load_providers
+    auto_cmd
+    ;;
+  install)
+    install_cmd
+    ;;
+  uninstall)
+    uninstall_cmd
+    ;;
+  default)
+    switch_dns default
+    ;;
+  "")
+    load_providers
+    opts=("${PROVIDER_ORDER[@]}" "default")
+    tui_select "${opts[@]}"
+    ;;
+  *)
+    load_providers
+    switch_dns "$1"
+    ;;
+esac
