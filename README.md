@@ -76,6 +76,7 @@ cloudflare=1.1.1.1#one.one.one.one,1.0.0.1#one.one.one.one
 ```bash
 dns-switch uninstall
 rm ~/.local/bin/dns-switch
+rm -rf ~/.config/dns-switch
 ```
 
 ## License
