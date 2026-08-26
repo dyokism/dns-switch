@@ -1,5 +1,7 @@
 # dns-switch
 
+![dns-switch demo](demo.gif)
+
 A bash TUI and CLI for managing DNS over TLS (DoT) and DNSSEC via `systemd-resolved` and `NetworkManager`.
 
 ## Features
