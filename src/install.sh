@@ -17,15 +17,17 @@ REPO_BASE="https://raw.githubusercontent.com/dyokism/dns-switch/main/src"
 get_file() {
   local filename="$1"
   local target="$2"
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
   
   if [[ -f "$filename" ]]; then
     cp "$filename" "$target"
-  elif [[ -f "$(dirname "$0")/$filename" ]]; then
-    cp "$(dirname "$0")/$filename" "$target"
+  elif [[ -n "$script_dir" && -f "$script_dir/$filename" ]]; then
+    cp "$script_dir/$filename" "$target"
   else
     echo "Downloading $filename..."
     if command -v curl >/dev/null 2>&1; then
-      curl -sSL "$REPO_BASE/$filename" -o "$target"
+      curl -fsSL "$REPO_BASE/$filename" -o "$target"
     elif command -v wget >/dev/null 2>&1; then
       wget -qO "$target" "$REPO_BASE/$filename"
     else
