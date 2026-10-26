@@ -1,9 +1,17 @@
-<div align="center">
-  # dns-switch
-  *DNS over TLS (DoT) and DNSSEC switcher for systemd-resolved.*
+<h1 align="center">dns-switch</h1>
 
-  [Features](#features) • [Requirements](#requirements) • [Installation](#installation) • [Usage](#usage) • [Configuration](#configuration) • [Uninstallation](#uninstallation)
-</div>
+<p align="center">
+  <em>DNS over TLS (DoT) and DNSSEC switcher for systemd-resolved.</em>
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> &bull;
+  <a href="#requirements">Requirements</a> &bull;
+  <a href="#installation">Installation</a> &bull;
+  <a href="#usage">Usage</a> &bull;
+  <a href="#configuration">Configuration</a> &bull;
+  <a href="#uninstallation">Uninstallation</a>
+</p>
 
 `dns-switch` is a small Bash utility for managing DNS over TLS (DoT) and DNSSEC through `systemd-resolved` and `NetworkManager`. It works as an interactive terminal picker and as a standard CLI, letting you switch resolvers, test latency, or drop back to default DHCP DNS when needed.
 
